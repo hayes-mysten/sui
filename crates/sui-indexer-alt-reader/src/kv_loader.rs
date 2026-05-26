@@ -82,6 +82,11 @@ pub struct KvArgs {
     #[arg(long, group = "kv_source")]
     pub ledger_grpc_url: Option<Uri>,
 
+    /// Whether the configured ledger gRPC service also has alpha experimental query APIs enabled
+    /// (e.g. bitmap-backed transaction pagination). When unset, treated as `false`.
+    #[arg(long)]
+    pub enable_experimental_query_apis: Option<bool>,
+
     /// Time spent waiting for a request to the kv store to complete, in milliseconds.
     #[arg(long, alias = "bigtable-statement-timeout-ms")]
     pub kv_statement_timeout_ms: Option<u64>,
@@ -197,6 +202,7 @@ impl KvArgs {
         LedgerGrpcArgs {
             ledger_grpc_statement_timeout_ms: self.kv_statement_timeout_ms,
             ledger_grpc_max_decoding_message_size: self.kv_max_decoding_message_size,
+            enable_experimental_query_apis: self.enable_experimental_query_apis,
         }
     }
 }
