@@ -7,6 +7,7 @@ use async_graphql::InputObject;
 use async_graphql::InputValueError;
 
 use sui_indexer_alt_reader::kv_loader::TransactionContents;
+use sui_rpc::proto::sui::rpc::v2alpha;
 use sui_types::transaction::TransactionDataAPI;
 
 use crate::api::scalars::fq_name_filter::FqNameFilter;
@@ -158,6 +159,47 @@ impl TransactionFilter {
         filters
     }
 
+    /// Lower this filter's predicate fields into a single-term v2alpha proto
+    /// `TransactionFilter` for a bitmap scan. Returns `None` when no positive
+    /// predicate is set — an unfiltered scan over the checkpoint range, where the
+    /// proto `filter` field is left absent.
+    ///
+    /// `TransactionFilterValidator` permits at most one of
+    /// `[affectedAddress, affectedObject, function]`, optionally combined with
+    /// `sentAddress`, so the result is always a single `TransactionTerm` (an AND)
+    /// of one or two `Include` literals — the trivial anchored-DNF shape. Checkpoint
+    /// bounds are not encoded here; they become the request's checkpoint range.
+    ///
+    /// Precondition: `kind` must be `None`. The `kind` filter has no bitmap
+    /// dimension and is routed to Postgres before reaching this builder, so any
+    /// `kind` predicate is ignored here.
+    pub(crate) fn to_bitmap_filter(&self) -> Option<v2alpha::TransactionFilter> {
+        let mut literals = Vec::new();
+
+        if let Some(sent) = &self.sent_address {
+            literals.push(include_literal(sender_predicate(sent)));
+        }
+        if let Some(address) = &self.affected_address {
+            literals.push(include_literal(affected_address_predicate(address)));
+        }
+        if let Some(object) = &self.affected_object {
+            literals.push(include_literal(affected_object_predicate(object)));
+        }
+        if let Some(function) = &self.function {
+            literals.push(include_literal(move_call_predicate(function)));
+        }
+
+        if literals.is_empty() {
+            return None;
+        }
+
+        let mut term = v2alpha::TransactionTerm::default();
+        term.literals = literals;
+        let mut filter = v2alpha::TransactionFilter::default();
+        filter.terms = vec![term];
+        Some(filter)
+    }
+
     /// Check if a transaction's contents matches this filter's non-checkpoint conditions.
     ///
     /// Checkpoint bounds (after/at/before) are not checked here — they are handled by the
@@ -249,5 +291,169 @@ impl CheckpointBounds for TransactionFilter {
 
     fn before_checkpoint(&self) -> Option<UInt53> {
         self.before_checkpoint
+    }
+}
+
+/// Wrap a predicate as an `Include` literal (the only polarity the parity filter
+/// emits — `Exclude`/negation is part of the later DNF-expressive phase).
+fn include_literal(
+    predicate: v2alpha::transaction_predicate::Predicate,
+) -> v2alpha::TransactionLiteral {
+    let mut p = v2alpha::TransactionPredicate::default();
+    p.predicate = Some(predicate);
+    let mut literal = v2alpha::TransactionLiteral::default();
+    literal.polarity = Some(v2alpha::transaction_literal::Polarity::Include(p));
+    literal
+}
+
+fn sender_predicate(address: &SuiAddress) -> v2alpha::transaction_predicate::Predicate {
+    let mut f = v2alpha::SenderFilter::default();
+    f.address = Some(address.to_string());
+    v2alpha::transaction_predicate::Predicate::Sender(f)
+}
+
+fn affected_address_predicate(address: &SuiAddress) -> v2alpha::transaction_predicate::Predicate {
+    let mut f = v2alpha::AffectedAddressFilter::default();
+    f.address = Some(address.to_string());
+    v2alpha::transaction_predicate::Predicate::AffectedAddress(f)
+}
+
+fn affected_object_predicate(object: &SuiAddress) -> v2alpha::transaction_predicate::Predicate {
+    let mut f = v2alpha::AffectedObjectFilter::default();
+    f.object_id = Some(object.to_string());
+    v2alpha::transaction_predicate::Predicate::AffectedObject(f)
+}
+
+fn move_call_predicate(function: &FqNameFilter) -> v2alpha::transaction_predicate::Predicate {
+    let mut f = v2alpha::MoveCallFilter::default();
+    f.function = Some(function.to_string());
+    v2alpha::transaction_predicate::Predicate::MoveCall(f)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn addr(s: &str) -> SuiAddress {
+        s.parse().expect("valid address")
+    }
+
+    /// Extract the predicates from a single-term filter, asserting every literal is
+    /// an `Include` (the parity shape).
+    fn term_includes(
+        filter: &v2alpha::TransactionFilter,
+    ) -> Vec<&v2alpha::transaction_predicate::Predicate> {
+        assert_eq!(filter.terms.len(), 1, "parity filter is a single term");
+        filter.terms[0]
+            .literals
+            .iter()
+            .map(
+                |literal| match literal.polarity.as_ref().expect("polarity set") {
+                    v2alpha::transaction_literal::Polarity::Include(p) => {
+                        p.predicate.as_ref().expect("predicate set")
+                    }
+                    other => panic!("expected Include literal, got {other:?}"),
+                },
+            )
+            .collect()
+    }
+
+    #[test]
+    fn unfiltered_yields_no_proto_filter() {
+        let filter = TransactionFilter::default();
+        assert!(filter.to_bitmap_filter().is_none());
+    }
+
+    #[test]
+    fn checkpoint_bounds_alone_are_not_a_predicate() {
+        let filter = TransactionFilter {
+            after_checkpoint: Some(UInt53::from(10)),
+            before_checkpoint: Some(UInt53::from(20)),
+            ..Default::default()
+        };
+        // Checkpoint bounds map to the request's checkpoint range, not the filter.
+        assert!(filter.to_bitmap_filter().is_none());
+    }
+
+    #[test]
+    fn sent_address_maps_to_sender_include() {
+        let sender = addr("0x2");
+        let filter = TransactionFilter {
+            sent_address: Some(sender),
+            ..Default::default()
+        };
+
+        let proto = filter.to_bitmap_filter().expect("serviceable");
+        let predicates = term_includes(&proto);
+        assert_eq!(predicates.len(), 1);
+        match predicates[0] {
+            v2alpha::transaction_predicate::Predicate::Sender(f) => {
+                assert_eq!(f.address.as_deref(), Some(sender.to_string().as_str()));
+            }
+            other => panic!("expected Sender, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn affected_object_maps_to_affected_object_include() {
+        let object = addr("0xabc");
+        let filter = TransactionFilter {
+            affected_object: Some(object),
+            ..Default::default()
+        };
+
+        let proto = filter.to_bitmap_filter().expect("serviceable");
+        let predicates = term_includes(&proto);
+        assert_eq!(predicates.len(), 1);
+        match predicates[0] {
+            v2alpha::transaction_predicate::Predicate::AffectedObject(f) => {
+                assert_eq!(f.object_id.as_deref(), Some(object.to_string().as_str()));
+            }
+            other => panic!("expected AffectedObject, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn function_maps_to_move_call_include() {
+        let function = FqNameFilter::FqName(addr("0x2"), "coin".to_string(), "join".to_string());
+        let expected = function.to_string();
+        let filter = TransactionFilter {
+            function: Some(function),
+            ..Default::default()
+        };
+
+        let proto = filter.to_bitmap_filter().expect("serviceable");
+        let predicates = term_includes(&proto);
+        assert_eq!(predicates.len(), 1);
+        match predicates[0] {
+            v2alpha::transaction_predicate::Predicate::MoveCall(f) => {
+                assert_eq!(f.function.as_deref(), Some(expected.as_str()));
+            }
+            other => panic!("expected MoveCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sent_address_combines_with_affected_object_in_one_term() {
+        let sender = addr("0x2");
+        let object = addr("0xabc");
+        let filter = TransactionFilter {
+            sent_address: Some(sender),
+            affected_object: Some(object),
+            ..Default::default()
+        };
+
+        let proto = filter.to_bitmap_filter().expect("serviceable");
+        // Both predicates land as Include literals in the same term (an AND).
+        let predicates = term_includes(&proto);
+        assert_eq!(predicates.len(), 2);
+        assert!(matches!(
+            predicates[0],
+            v2alpha::transaction_predicate::Predicate::Sender(_)
+        ));
+        assert!(matches!(
+            predicates[1],
+            v2alpha::transaction_predicate::Predicate::AffectedObject(_)
+        ));
     }
 }
