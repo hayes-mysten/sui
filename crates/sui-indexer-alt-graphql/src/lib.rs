@@ -424,11 +424,8 @@ pub async fn start_rpc(
         .data(kv_loader)
         .data(package_store);
 
-    // Expose the ledger gRPC reader to resolvers (e.g. the bitmap-backed
-    // transaction pagination path). Absent when no ledger gRPC URL is
-    // configured, in which case resolvers fall back to Postgres.
-    if let Some(ledger_grpc_reader) = ledger_grpc_reader {
-        rpc = rpc.data(ledger_grpc_reader);
+    if let Some(reader) = ledger_grpc_reader.as_ref().filter(|r| r.has_alpha()) {
+        rpc = rpc.data(reader.clone());
     }
 
     if let Some(fullnode_client) = fullnode_client {

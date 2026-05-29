@@ -8,17 +8,28 @@ use anyhow::Context as _;
 use async_graphql::Context;
 use async_graphql::Object;
 use async_graphql::connection::Connection;
+use async_graphql::connection::CursorType;
+use async_graphql::connection::Edge;
+use async_graphql::connection::EmptyFields;
+use async_graphql::connection::PageInfo;
 use async_graphql::dataloader::DataLoader;
 use diesel::QueryableByName;
 use diesel::sql_types::BigInt;
 use fastcrypto::encoding::Base58;
 use fastcrypto::encoding::Encoding;
 use futures::future::try_join_all;
+use prost_types::FieldMask;
+use serde::Deserialize;
+use serde::Serialize;
 use sui_indexer_alt_reader::kv_loader::KvLoader;
 use sui_indexer_alt_reader::kv_loader::TransactionContents as NativeTransactionContents;
+use sui_indexer_alt_reader::ledger_grpc_reader::LedgerGrpcReader;
+use sui_indexer_alt_reader::ledger_grpc_reader::StreamPage;
 use sui_indexer_alt_reader::pg_reader::PgReader;
 use sui_indexer_alt_reader::tx_digests::TxDigestKey;
 use sui_pg_db::query::Query;
+use sui_rpc::field::FieldMaskUtil;
+use sui_rpc::proto::sui::rpc::v2alpha;
 use sui_sql_macro::query;
 use sui_types::base_types::SuiAddress as NativeSuiAddress;
 use sui_types::digests::TransactionDigest;
@@ -26,7 +37,7 @@ use sui_types::transaction::TransactionDataAPI;
 use sui_types::transaction::TransactionExpiration;
 
 use crate::api::scalars::base64::Base64;
-use crate::api::scalars::cursor::JsonCursor;
+use crate::api::scalars::cursor::BcsCursor;
 use crate::api::scalars::digest::Digest;
 use crate::api::scalars::fq_name_filter::FqNameFilter;
 use crate::api::scalars::id::Id;
@@ -34,6 +45,7 @@ use crate::api::scalars::json::Json;
 use crate::api::scalars::sui_address::SuiAddress;
 use crate::api::types::address::Address;
 use crate::api::types::available_range::AvailableRangeKey;
+use crate::api::types::checkpoint::filter::checkpoint_bounds;
 use crate::api::types::epoch::Epoch;
 use crate::api::types::gas_input::GasInput;
 use crate::api::types::lookups::CheckpointBounds;
@@ -65,7 +77,76 @@ pub(crate) struct TransactionContents {
     pub(crate) contents: Option<Arc<NativeTransactionContents>>,
 }
 
-pub(crate) type CTransaction = JsonCursor<u64>;
+/// Cursor for transaction pagination, BCS-encoded. BCS serializes the enum's
+/// variant index, which doubles as the discriminant that distinguishes the two
+/// paths: the Postgres path emits/consumes `Seq` (a `tx_sequence_number`); the
+/// bitmap path emits/consumes `Opaque` (the v2alpha `Watermark.cursor` bytes). A
+/// cursor of the wrong variant for the active path is rejected loudly rather than
+/// misinterpreted (see `Transaction::paginate`).
+///
+/// Note: this is a new wire format, so cursors minted by an older build won't
+/// decode — acceptable, as pagination cursors are short-lived.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) enum TxCursor {
+    Seq(u64),
+    Opaque(Vec<u8>),
+}
+
+pub(crate) type CTransaction = BcsCursor<TxCursor>;
+
+/// Custom `Connection` for transactions to support partially-filled pages.
+pub(crate) struct TransactionConnection {
+    pub edges: Vec<Edge<String, Transaction, EmptyFields>>,
+    pub page_info: PageInfo,
+}
+
+#[Object]
+impl TransactionConnection {
+    /// Information to aid in pagination.
+    async fn page_info(&self) -> &PageInfo {
+        &self.page_info
+    }
+
+    /// A list of edges.
+    async fn edges(&self) -> &[Edge<String, Transaction, EmptyFields>] {
+        &self.edges
+    }
+
+    /// A list of nodes.
+    async fn nodes(&self) -> Vec<&Transaction> {
+        self.edges.iter().map(|e| &e.node).collect()
+    }
+}
+
+impl From<Connection<String, Transaction>> for TransactionConnection {
+    /// Convert a stock async-graphql `Connection` (as produced by the PG path's
+    /// `Page::paginate_results`) into the custom shape. Cursors are derived from edges, matching
+    /// stock semantics.
+    fn from(conn: Connection<String, Transaction>) -> Self {
+        let start_cursor = conn.edges.first().map(|e| e.cursor.clone());
+        let end_cursor = conn.edges.last().map(|e| e.cursor.clone());
+        Self {
+            edges: conn.edges,
+            page_info: PageInfo {
+                has_previous_page: conn.has_previous_page,
+                has_next_page: conn.has_next_page,
+                start_cursor,
+                end_cursor,
+            },
+        }
+    }
+}
+
+impl TxCursor {
+    /// The `tx_sequence_number` for a Postgres-path cursor, or `None` for an
+    /// opaque bitmap cursor.
+    fn seq(&self) -> Option<u64> {
+        match self {
+            TxCursor::Seq(s) => Some(*s),
+            TxCursor::Opaque(_) => None,
+        }
+    }
+}
 
 /// Description of a transaction, the unit of activity on Sui.
 #[Object]
@@ -253,9 +334,11 @@ impl Transaction {
         transactions: &[ProcessedTransaction],
         page: &Page<CTransaction>,
         filter: TransactionFilter,
-    ) -> Result<Connection<String, Transaction>, RpcError> {
-        let after = page.after().map(|c| **c);
-        let before = page.before().map(|c| **c);
+    ) -> Result<TransactionConnection, RpcError> {
+        // Preloaded (streaming) pagination always uses sequence-number cursors; an
+        // opaque cursor would yield `None` here, i.e. no bound.
+        let after = page.after().and_then(|c| c.seq());
+        let before = page.before().and_then(|c| c.seq());
 
         let filtered: Vec<_> = transactions
             .iter()
@@ -267,9 +350,10 @@ impl Transaction {
 
         page.paginate_results(
             filtered,
-            |tx| JsonCursor::new(tx.tx_sequence_number),
+            |tx| BcsCursor::new(TxCursor::Seq(tx.tx_sequence_number)),
             |tx| Transaction::with_contents(scope.clone(), tx.contents.clone()),
         )
+        .map(Into::into)
     }
 
     /// Load the transaction from the store, and return it fully inflated (with contents already
@@ -299,7 +383,19 @@ impl Transaction {
         scope: Scope,
         page: Page<CTransaction>,
         filter: TransactionFilter,
-    ) -> Result<Connection<String, Transaction>, RpcError> {
+    ) -> Result<TransactionConnection, RpcError> {
+        // Serve non-`kind` transaction pagination from the roaring-bitmap index when a ledger gRPC
+        // reader is present in the context. `kind` has no bitmap dimension and stays on Postgres.
+        if filter.kind.is_none() {
+            if let Some(reader) = ctx.data_opt::<LedgerGrpcReader>() {
+                return Self::paginate_bitmap(ctx, reader, scope, page, filter).await;
+            }
+        }
+
+        // Reject cursors incompatible with Postgres
+        require_seq_cursor(page.after())?;
+        require_seq_cursor(page.before())?;
+
         let watermarks: &Arc<Watermarks> = ctx.data()?;
         let available_range_key = AvailableRangeKey {
             type_: "Query".to_string(),
@@ -309,7 +405,7 @@ impl Transaction {
         let reader_lo = available_range_key.reader_lo(watermarks)?;
 
         let Some(query) = filter.tx_bounds(ctx, &scope, reader_lo, &page).await? else {
-            return Ok(Connection::new(false, false));
+            return Ok(Connection::new(false, false).into());
         };
 
         let TransactionFilter {
@@ -339,9 +435,88 @@ impl Transaction {
 
         page.paginate_results(
             tx_digests(ctx, &tx_sequence_numbers).await?,
-            |(s, _)| JsonCursor::new(*s),
+            |(s, _)| BcsCursor::new(TxCursor::Seq(*s)),
             |(_, d)| Ok(Self::with_digest(scope.clone(), d)),
         )
+        .map(Into::into)
+    }
+
+    /// Serve transaction pagination from the roaring-bitmap index via the v2alpha
+    /// `ListTransactions` stream. The checkpoint window is derived exactly as the
+    /// Postgres path derives it (`checkpoint_bounds` over `reader_lo` /
+    /// `checkpoint_viewed_at` / filter bounds) and sent as a checkpoint range; the
+    /// opaque page cursors become `QueryOptions.after`/`before` (the position
+    /// within that window). Hydration is digest-only — contents resolve lazily via
+    /// `KvLoader` on field access, so this path never touches Postgres.
+    async fn paginate_bitmap(
+        ctx: &Context<'_>,
+        reader: &LedgerGrpcReader,
+        scope: Scope,
+        page: Page<CTransaction>,
+        filter: TransactionFilter,
+    ) -> Result<TransactionConnection, RpcError> {
+        if page.limit() == 0 {
+            return Ok(Connection::new(false, false).into());
+        }
+
+        // Consistency upper bound; empty when scope has no checkpoint set.
+        let Some(checkpoint_viewed_at) = scope.checkpoint_viewed_at() else {
+            return Ok(Connection::new(false, false).into());
+        };
+
+        // Availability lower bound, keyed on the same active filters as the PG path.
+        let watermarks: &Arc<Watermarks> = ctx.data()?;
+        let available_range_key = AvailableRangeKey {
+            type_: "Query".to_string(),
+            field: Some("transactions".to_string()),
+            filters: Some(filter.active_filters()),
+        };
+        let reader_lo = available_range_key.reader_lo(watermarks)?;
+
+        let Some(cp_bounds) = checkpoint_bounds(
+            filter.after_checkpoint().map(u64::from),
+            filter.at_checkpoint().map(u64::from),
+            filter.before_checkpoint().map(u64::from),
+            reader_lo,
+            checkpoint_viewed_at,
+        ) else {
+            return Ok(Connection::new(false, false).into());
+        };
+
+        // Opaque ledger-position bounds (ordering-independent); reject a stale
+        // sequence-number cursor that reached the bitmap path.
+        let after = bitmap_cursor(page.after())?;
+        let before = bitmap_cursor(page.before())?;
+
+        let mut options = v2alpha::QueryOptions::default();
+        options.limit_items = Some((page.limit() + 1) as u32);
+        options.after = after.map(|cursor| cursor.into());
+        options.before = before.map(|cursor| cursor.into());
+        options.ordering = if page.is_from_front() {
+            v2alpha::Ordering::Ascending as i32
+        } else {
+            v2alpha::Ordering::Descending as i32
+        };
+
+        let mut request = v2alpha::ListTransactionsRequest::default();
+        // Digest only — contents hydrate lazily via `KvLoader` on field access.
+        request.read_mask = Some(FieldMask::from_paths(["digest"]));
+        request.start_checkpoint = Some(*cp_bounds.start());
+        // `cp_bounds` end is inclusive; the request bound is exclusive.
+        request.end_checkpoint = Some(*cp_bounds.end() + 1);
+        request.filter = filter.to_bitmap_filter();
+        request.options = Some(options);
+
+        let result = reader
+            .list_transactions(request)
+            .await
+            .map_err(|e| anyhow::anyhow!("ListTransactions request failed: {e}"))?;
+
+        // Can't reuse `page.paginate_results`: it detects `hasPrev`/`hasNext` via cursor equality
+        // with the supplied `after`/`before`, but streaming api bounds are exclusive (boundary
+        // never returned). Stream termination (`SCAN_LIMIT`, `ITEM_LIMIT`, unknown end reason, or
+        // no `QueryEnd` frame at all) also need to be handled as a "more results" signal.
+        build_bitmap_connection(scope, &page, result)
     }
 }
 
@@ -404,7 +579,12 @@ impl TransactionContents {
 
 impl TxBoundsCursor for CTransaction {
     fn tx_sequence_number(&self) -> u64 {
-        *self.deref()
+        match self.deref() {
+            TxCursor::Seq(s) => *s,
+            // Opaque (bitmap) cursors are rejected before the Postgres path runs
+            // (`require_seq_cursor`); fall back to an empty range defensively.
+            TxCursor::Opaque(_) => u64::MAX,
+        }
     }
 }
 
@@ -417,6 +597,103 @@ impl From<TransactionEffects> for Transaction {
             contents: TransactionContents { scope, contents },
         }
     }
+}
+
+/// Build a `TransactionConnection` from draining a bitmap-scan page.
+///
+/// Edges are returned in ascending order.
+fn build_bitmap_connection(
+    scope: Scope,
+    page: &Page<CTransaction>,
+    result: StreamPage<v2alpha::TransactionItem>,
+) -> Result<TransactionConnection, RpcError> {
+    let next_cursor_bytes = result.next_cursor().cloned();
+    let has_more = next_cursor_bytes.is_some();
+    let StreamPage { mut items, .. } = result;
+
+    let over_fetched = items.len() > page.limit();
+    if over_fetched {
+        items.truncate(page.limit());
+    }
+    let more = over_fetched || has_more;
+
+    let (has_previous_page, has_next_page) = if page.is_from_front() {
+        (page.after().is_some(), more)
+    } else {
+        // A descending (`last`) scan walks high -> low, so "more" means earlier
+        // items remain before the page.
+        (more, page.before().is_some())
+    };
+
+    if !page.is_from_front() {
+        items.reverse();
+    }
+
+    let mut edges = Vec::with_capacity(items.len());
+    for item in items {
+        let digest = item
+            .transaction
+            .as_ref()
+            .and_then(|tx| tx.digest.as_deref())
+            .context("ListTransactions item missing transaction digest")?
+            .parse::<TransactionDigest>()
+            .context("Failed to parse transaction digest from ListTransactions")?;
+
+        let cursor = item
+            .watermark
+            .as_ref()
+            .and_then(|w| w.cursor.as_ref())
+            .context("ListTransactions item missing watermark cursor")?;
+        let cursor = BcsCursor::new(TxCursor::Opaque(cursor.to_vec())).encode_cursor();
+
+        edges.push(Edge::new(
+            cursor,
+            Transaction::with_digest(scope.clone(), digest),
+        ));
+    }
+
+    // Terminal-watermark fallback for cursors when edges are empty: lets a
+    // zero-edges partial response still carry a resume point. The encoded form
+    // matches the per-item edge cursor (BCS-encoded `TxCursor::Opaque`).
+    let watermark_cursor = next_cursor_bytes
+        .as_ref()
+        .map(|bytes| BcsCursor::new(TxCursor::Opaque(bytes.to_vec())).encode_cursor());
+
+    let start_cursor = edges
+        .first()
+        .map(|e| e.cursor.clone())
+        .or_else(|| watermark_cursor.clone());
+    let end_cursor = edges.last().map(|e| e.cursor.clone()).or(watermark_cursor);
+
+    Ok(TransactionConnection {
+        edges,
+        page_info: PageInfo {
+            has_previous_page,
+            has_next_page,
+            start_cursor,
+            end_cursor,
+        },
+    })
+}
+
+/// The opaque ledger-position bound for a bitmap scan, or `None` for no bound.
+/// Errors on a sequence-number cursor (a stale Postgres cursor reaching the
+/// bitmap path, e.g. after the flag was flipped mid-pagination) rather than
+/// misinterpreting it.
+fn bitmap_cursor(cursor: Option<&CTransaction>) -> Result<Option<Vec<u8>>, RpcError> {
+    match cursor.map(|c| c.deref()) {
+        None => Ok(None),
+        Some(TxCursor::Opaque(bytes)) => Ok(Some(bytes.clone())),
+        Some(TxCursor::Seq(_)) => Err(crate::pagination::Error::InvalidCursor.into()),
+    }
+}
+
+/// Require a cursor that maps to a sequence, rejects otherwise.
+fn require_seq_cursor(cursor: Option<&CTransaction>) -> Result<(), RpcError> {
+    if matches!(cursor.map(|c| c.deref()), Some(TxCursor::Opaque(_))) {
+        return Err(crate::pagination::Error::InvalidCursor.into());
+    }
+    Ok(())
 }
 
 pub(crate) async fn tx_digests(
