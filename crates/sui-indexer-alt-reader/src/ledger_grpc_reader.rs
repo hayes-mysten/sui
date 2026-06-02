@@ -538,7 +538,10 @@ mod tests {
 
         let mut page: StreamPage<grpc_alpha::TransactionItem> = StreamPage::default();
         assert!(page.apply(response.into()));
-        assert_eq!(page.end_reason, Some(grpc_alpha::QueryEndReason::Unspecified));
+        assert_eq!(
+            page.end_reason,
+            Some(grpc_alpha::QueryEndReason::Unspecified)
+        );
     }
 
     #[test]
