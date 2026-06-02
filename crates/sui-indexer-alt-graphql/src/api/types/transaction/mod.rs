@@ -112,36 +112,6 @@ impl TransactionConnection {
     }
 }
 
-impl From<Connection<String, Transaction>> for TransactionConnection {
-    /// Convert a stock async-graphql `Connection` (as produced by the PG path's
-    /// `Page::paginate_results`) into the custom shape. Cursors are derived from edges, matching
-    /// stock semantics.
-    fn from(conn: Connection<String, Transaction>) -> Self {
-        let start_cursor = conn.edges.first().map(|e| e.cursor.clone());
-        let end_cursor = conn.edges.last().map(|e| e.cursor.clone());
-        Self {
-            edges: conn.edges,
-            page_info: PageInfo {
-                has_previous_page: conn.has_previous_page,
-                has_next_page: conn.has_next_page,
-                start_cursor,
-                end_cursor,
-            },
-        }
-    }
-}
-
-impl TxCursor {
-    /// The `tx_sequence_number` for a Postgres-path cursor, or `None` for an
-    /// opaque bitmap cursor.
-    fn seq(&self) -> Option<u64> {
-        match self {
-            TxCursor::Seq(s) => Some(*s),
-            TxCursor::Opaque(_) => None,
-        }
-    }
-}
-
 /// Description of a transaction, the unit of activity on Sui.
 #[Object]
 impl Transaction {
@@ -382,7 +352,7 @@ impl Transaction {
         // reader is present in the context. `kind` has no bitmap dimension and stays on Postgres.
         if filter.kind.is_none() {
             if let Some(reader) = ctx.data_opt::<LedgerGrpcReader>() {
-                return Self::paginate_bitmap(ctx, reader, scope, page, filter).await;
+                return Self::paginate_bitmap(reader, scope, page, filter).await;
             }
         }
 
@@ -438,7 +408,6 @@ impl Transaction {
     /// Serve transaction pagination by streaming the roaring-bitmap index. Returns pages that may
     /// be partially filled, with valid cursors if there are more pages to paginate through.
     async fn paginate_bitmap(
-        ctx: &Context<'_>,
         reader: &LedgerGrpcReader,
         scope: Scope,
         page: Page<CTransaction>,
@@ -486,14 +455,14 @@ impl Transaction {
         request.read_mask = Some(FieldMask::from_paths(["digest"]));
         request.start_checkpoint = Some(*cp_bounds.start());
         // `cp_bounds` end is inclusive; the request bound is exclusive.
-        request.end_checkpoint = Some(*cp_bounds.end() + 1);
+        request.end_checkpoint = Some(cp_bounds.end().saturating_add(1));
         request.filter = filter.to_bitmap_filter();
         request.options = Some(options);
 
         let result = reader
             .list_transactions(request)
             .await
-            .map_err(|e| anyhow::anyhow!("ListTransactions request failed: {e}"))?;
+            .context("Failed to list transactions")?;
 
         build_bitmap_connection(scope, &page, result)
     }
@@ -556,6 +525,17 @@ impl TransactionContents {
     }
 }
 
+impl TxCursor {
+    /// The `tx_sequence_number` for a Postgres-path cursor, or `None` for an
+    /// opaque bitmap cursor.
+    fn seq(&self) -> Option<u64> {
+        match self {
+            TxCursor::Seq(s) => Some(*s),
+            TxCursor::Opaque(_) => None,
+        }
+    }
+}
+
 impl TxBoundsCursor for CTransaction {
     fn tx_sequence_number(&self) -> u64 {
         match self.deref() {
@@ -574,6 +554,25 @@ impl From<TransactionEffects> for Transaction {
         Self {
             digest: fx.digest,
             contents: TransactionContents { scope, contents },
+        }
+    }
+}
+
+impl From<Connection<String, Transaction>> for TransactionConnection {
+    /// Convert a stock async-graphql `Connection` (as produced by the PG path's
+    /// `Page::paginate_results`) into the custom shape. Cursors are derived from edges, matching
+    /// stock semantics.
+    fn from(conn: Connection<String, Transaction>) -> Self {
+        let start_cursor = conn.edges.first().map(|e| e.cursor.clone());
+        let end_cursor = conn.edges.last().map(|e| e.cursor.clone());
+        Self {
+            edges: conn.edges,
+            page_info: PageInfo {
+                has_previous_page: conn.has_previous_page,
+                has_next_page: conn.has_next_page,
+                start_cursor,
+                end_cursor,
+            },
         }
     }
 }
@@ -631,9 +630,8 @@ fn build_bitmap_connection(
         ));
     }
 
-    // Terminal-watermark fallback for cursors when edges are empty: lets a
-    // zero-edges partial response still carry a resume point. The encoded form
-    // matches the per-item edge cursor (BCS-encoded `TxCursor::Opaque`).
+    // On empty pages, the start and end cursors are the same. This is needed so that backwards
+    // pagination returns the exact previous page, at the cost of some re-scanning.
     let watermark_cursor = next_cursor_bytes
         .as_ref()
         .map(|bytes| BcsCursor::new(TxCursor::Opaque(bytes.to_vec())).encode_cursor());

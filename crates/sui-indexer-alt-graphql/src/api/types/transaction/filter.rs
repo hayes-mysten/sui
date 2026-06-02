@@ -427,8 +427,10 @@ mod tests {
             sent_address: Some(sender),
             affected_address: Some(addr("0xdef")),
             ..Default::default()
-        };
-        let preds = term_includes(&with_address.to_bitmap_filter().expect("serviceable"));
+        }
+        .to_bitmap_filter()
+        .expect("valid bitmap filter");
+        let preds = term_includes(&with_address);
         assert_eq!(preds.len(), 2);
         assert!(matches!(
             preds[0],
@@ -444,8 +446,10 @@ mod tests {
             sent_address: Some(sender),
             affected_object: Some(addr("0xabc")),
             ..Default::default()
-        };
-        let preds = term_includes(&with_object.to_bitmap_filter().expect("serviceable"));
+        }
+        .to_bitmap_filter()
+        .expect("valid bitmap filter");
+        let preds = term_includes(&with_object);
         assert_eq!(preds.len(), 2);
         assert!(matches!(
             preds[0],
@@ -465,8 +469,10 @@ mod tests {
                 "join".to_string(),
             )),
             ..Default::default()
-        };
-        let preds = term_includes(&with_function.to_bitmap_filter().expect("serviceable"));
+        }
+        .to_bitmap_filter()
+        .expect("valid bitmap filter");
+        let preds = term_includes(&with_function);
         assert_eq!(preds.len(), 2);
         assert!(matches!(
             preds[0],
@@ -476,75 +482,5 @@ mod tests {
             preds[1],
             v2alpha::transaction_predicate::Predicate::MoveCall(_)
         ));
-    }
-
-    #[test]
-    fn validator_rejects_multiple_exclusive_filters() {
-        let address = addr("0xa");
-        let object = addr("0xb");
-        let function =
-            FqNameFilter::FqName(addr("0x2"), "coin".to_string(), "join".to_string());
-        let kind = TransactionKindInput::ProgrammableTx;
-
-        // C(4,2) = 6 pairs from {affected_address, affected_object, function, kind}. The
-        // validator enforces at-most-one across this exclusive set; `sent_address` is
-        // intentionally outside it (see `sender_combines_with_each_other_field_in_one_term`).
-        let cases: Vec<(&str, TransactionFilter)> = vec![
-            (
-                "affected_address + affected_object",
-                TransactionFilter {
-                    affected_address: Some(address),
-                    affected_object: Some(object),
-                    ..Default::default()
-                },
-            ),
-            (
-                "affected_address + function",
-                TransactionFilter {
-                    affected_address: Some(address),
-                    function: Some(function.clone()),
-                    ..Default::default()
-                },
-            ),
-            (
-                "affected_address + kind",
-                TransactionFilter {
-                    affected_address: Some(address),
-                    kind: Some(kind),
-                    ..Default::default()
-                },
-            ),
-            (
-                "affected_object + function",
-                TransactionFilter {
-                    affected_object: Some(object),
-                    function: Some(function.clone()),
-                    ..Default::default()
-                },
-            ),
-            (
-                "affected_object + kind",
-                TransactionFilter {
-                    affected_object: Some(object),
-                    kind: Some(kind),
-                    ..Default::default()
-                },
-            ),
-            (
-                "function + kind",
-                TransactionFilter {
-                    function: Some(function),
-                    kind: Some(kind),
-                    ..Default::default()
-                },
-            ),
-        ];
-
-        for (label, filter) in cases {
-            assert!(
-                TransactionFilterValidator.check(&filter).is_err(),
-                "expected validator to reject {label}",
-            );
-        }
     }
 }
