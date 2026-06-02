@@ -94,12 +94,12 @@ Response: {
         "pageInfo": {
           "hasPreviousPage": false,
           "hasNextPage": false,
-          "startCursor": "MA==",
-          "endCursor": "MQ=="
+          "startCursor": "AAAAAAAAAAAA",
+          "endCursor": "AAEAAAAAAAAA"
         },
         "edges": [
           {
-            "cursor": "MA==",
+            "cursor": "AAAAAAAAAAAA",
             "node": {
               "effects": {
                 "checkpoint": {
@@ -109,7 +109,7 @@ Response: {
             }
           },
           {
-            "cursor": "MQ==",
+            "cursor": "AAEAAAAAAAAA",
             "node": {
               "effects": {
                 "checkpoint": {
@@ -135,12 +135,12 @@ Response: {
         "pageInfo": {
           "hasPreviousPage": false,
           "hasNextPage": false,
-          "startCursor": "Mg==",
-          "endCursor": "MTA="
+          "startCursor": "AAIAAAAAAAAA",
+          "endCursor": "AAoAAAAAAAAA"
         },
         "edges": [
           {
-            "cursor": "Mg==",
+            "cursor": "AAIAAAAAAAAA",
             "node": {
               "effects": {
                 "checkpoint": {
@@ -150,7 +150,7 @@ Response: {
             }
           },
           {
-            "cursor": "Mw==",
+            "cursor": "AAMAAAAAAAAA",
             "node": {
               "effects": {
                 "checkpoint": {
@@ -160,7 +160,7 @@ Response: {
             }
           },
           {
-            "cursor": "NA==",
+            "cursor": "AAQAAAAAAAAA",
             "node": {
               "effects": {
                 "checkpoint": {
@@ -170,7 +170,7 @@ Response: {
             }
           },
           {
-            "cursor": "NQ==",
+            "cursor": "AAUAAAAAAAAA",
             "node": {
               "effects": {
                 "checkpoint": {
@@ -180,7 +180,7 @@ Response: {
             }
           },
           {
-            "cursor": "Ng==",
+            "cursor": "AAYAAAAAAAAA",
             "node": {
               "effects": {
                 "checkpoint": {
@@ -190,7 +190,7 @@ Response: {
             }
           },
           {
-            "cursor": "Nw==",
+            "cursor": "AAcAAAAAAAAA",
             "node": {
               "effects": {
                 "checkpoint": {
@@ -200,7 +200,7 @@ Response: {
             }
           },
           {
-            "cursor": "OA==",
+            "cursor": "AAgAAAAAAAAA",
             "node": {
               "effects": {
                 "checkpoint": {
@@ -210,7 +210,7 @@ Response: {
             }
           },
           {
-            "cursor": "OQ==",
+            "cursor": "AAkAAAAAAAAA",
             "node": {
               "effects": {
                 "checkpoint": {
@@ -220,7 +220,7 @@ Response: {
             }
           },
           {
-            "cursor": "MTA=",
+            "cursor": "AAoAAAAAAAAA",
             "node": {
               "effects": {
                 "checkpoint": {
