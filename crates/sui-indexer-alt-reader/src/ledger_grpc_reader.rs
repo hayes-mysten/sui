@@ -72,13 +72,14 @@ pub struct CheckpointedTransaction {
 #[derive(Clone)]
 pub struct LedgerGrpcReader {
     client: V2LedgerServiceClient<GrpcMetricsService<Channel>>,
-    /// Client dedicated to experimental apis on `LedgerService`.
     alpha_client: Option<V2alphaLedgerServiceClient<GrpcMetricsService<Channel>>>,
     timeout: Option<Duration>,
 }
 
-/// A page drained from a stream consisting of the items in stream order, the latest watermark
-/// cursor to continue paginating on, and why the stream stopped.
+/// A page drained from a stream consisting of the items in stream order, the cursors of the first
+/// and latest frames the stream emitted, and why the stream stopped.
+///
+/// `start_cursor` is the cursor of the first frame seen.
 ///
 /// `end_cursor` may be beyond the last item in the collected page.
 ///
@@ -86,6 +87,7 @@ pub struct LedgerGrpcReader {
 #[derive(Debug, Clone)]
 pub struct StreamPage<I> {
     pub items: Vec<I>,
+    pub start_cursor: Option<Bytes>,
     pub end_cursor: Option<Bytes>,
     pub end_reason: Option<grpc_alpha::QueryEndReason>,
 }
@@ -306,20 +308,26 @@ impl<I> StreamPage<I> {
         })
     }
 
-    /// Fold one frame into the page. The cursor is updated to the incoming item or standalone
-    /// watermark.
+    /// Fold one frame into the page. `start_cursor` latches on the first cursor seen; `end_cursor`
+    /// tracks the latest.
     ///
     /// Returns `true` when the frame is the terminal `QueryEnd`.
     fn apply(&mut self, frame: FrameKind<I>) -> bool {
         match frame {
             FrameKind::Item { item, cursor } => {
                 if cursor.is_some() {
+                    if self.start_cursor.is_none() {
+                        self.start_cursor = cursor.clone();
+                    }
                     self.end_cursor = cursor;
                 }
                 self.items.push(item);
             }
             FrameKind::Watermark { cursor } => {
                 if cursor.is_some() {
+                    if self.start_cursor.is_none() {
+                        self.start_cursor = cursor.clone();
+                    }
                     self.end_cursor = cursor;
                 }
             }
@@ -350,6 +358,7 @@ impl<I> Default for StreamPage<I> {
     fn default() -> Self {
         Self {
             items: Vec::new(),
+            start_cursor: None,
             end_cursor: None,
             end_reason: None,
         }
@@ -479,7 +488,9 @@ mod tests {
         assert!(page.apply(end_response(grpc_alpha::QueryEndReason::ItemLimit).into()));
 
         assert_eq!(page.items.len(), 2);
-        // Latest cursor wins, including a standalone watermark between items.
+        // `start_cursor` latches on the first cursor-bearing frame; `end_cursor` tracks the
+        // latest. Standalone watermarks between items don't reset either.
+        assert_eq!(page.start_cursor.as_deref(), Some(b"c1".as_ref()));
         assert_eq!(page.end_cursor.as_deref(), Some(b"c3".as_ref()));
         assert_eq!(page.end_reason, Some(grpc_alpha::QueryEndReason::ItemLimit));
     }
@@ -491,8 +502,24 @@ mod tests {
         assert!(page.apply(end_response(grpc_alpha::QueryEndReason::LedgerTip).into()));
 
         assert!(page.items.is_empty());
+        // First (and only) watermark sets both `start_cursor` and `end_cursor`.
+        assert_eq!(page.start_cursor.as_deref(), Some(b"w1".as_ref()));
         assert_eq!(page.end_cursor.as_deref(), Some(b"w1".as_ref()));
         assert_eq!(page.end_reason, Some(grpc_alpha::QueryEndReason::LedgerTip));
+    }
+
+    #[test]
+    fn start_cursor_latches_on_first_frame_and_does_not_update() {
+        // Multiple cursor-bearing frames: `start_cursor` should remain at the first one,
+        // `end_cursor` should track the latest.
+        let mut page: StreamPage<grpc_alpha::TransactionItem> = StreamPage::default();
+        page.apply(watermark_response(b"w1").into());
+        page.apply(item_response(b"c2").into());
+        page.apply(watermark_response(b"w3").into());
+        page.apply(item_response(b"c4").into());
+
+        assert_eq!(page.start_cursor.as_deref(), Some(b"w1".as_ref()));
+        assert_eq!(page.end_cursor.as_deref(), Some(b"c4".as_ref()));
     }
 
     #[test]
