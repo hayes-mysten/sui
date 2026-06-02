@@ -587,7 +587,11 @@ fn build_bitmap_connection(
 ) -> Result<TransactionConnection, RpcError> {
     let next_cursor_bytes = result.next_cursor().cloned();
     let has_more = next_cursor_bytes.is_some();
-    let StreamPage { mut items, .. } = result;
+    let StreamPage {
+        mut items,
+        start_cursor: start_cursor_bytes,
+        ..
+    } = result;
 
     let over_fetched = items.len() > page.limit();
     if over_fetched {
@@ -630,17 +634,22 @@ fn build_bitmap_connection(
         ));
     }
 
-    // On empty pages, the start and end cursors are the same. This is needed so that backwards
-    // pagination returns the exact previous page, at the cost of some re-scanning.
-    let watermark_cursor = next_cursor_bytes
+    // On empty pages, fall back to the stream-reported cursors.
+    let start_watermark_cursor = start_cursor_bytes
         .as_ref()
-        .map(|bytes| BcsCursor::new(TxCursor::Opaque(bytes.to_vec())).encode_cursor());
+        .map(|b| BcsCursor::new(TxCursor::Opaque(b.to_vec())).encode_cursor());
+    let end_watermark_cursor = next_cursor_bytes
+        .as_ref()
+        .map(|b| BcsCursor::new(TxCursor::Opaque(b.to_vec())).encode_cursor());
 
     let start_cursor = edges
         .first()
         .map(|e| e.cursor.clone())
-        .or_else(|| watermark_cursor.clone());
-    let end_cursor = edges.last().map(|e| e.cursor.clone()).or(watermark_cursor);
+        .or(start_watermark_cursor);
+    let end_cursor = edges
+        .last()
+        .map(|e| e.cursor.clone())
+        .or(end_watermark_cursor);
 
     Ok(TransactionConnection {
         edges,
