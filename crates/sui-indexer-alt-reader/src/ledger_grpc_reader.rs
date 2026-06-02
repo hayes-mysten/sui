@@ -6,6 +6,8 @@ use std::time::Duration;
 use anyhow::Context;
 use async_graphql::dataloader::DataLoader;
 use bytes::Bytes;
+use futures::Stream;
+use futures::StreamExt;
 use prometheus::Registry;
 use sui_rpc::proto::sui::rpc::v2 as grpc;
 use sui_rpc::proto::sui::rpc::v2::ledger_service_client::LedgerServiceClient as V2LedgerServiceClient;
@@ -16,7 +18,6 @@ use sui_types::event::Event;
 use sui_types::messages_checkpoint::CheckpointSummary;
 use sui_types::signature::GenericSignature;
 use sui_types::transaction::TransactionData;
-use tonic::Streaming;
 use tonic::transport::Channel;
 use tonic::transport::ClientTlsConfig;
 use tonic::transport::Uri;
@@ -376,29 +377,31 @@ impl From<grpc_alpha::ListTransactionsResponse> for FrameKind<grpc_alpha::Transa
     }
 }
 
-async fn drain_list_stream<R, I>(
+async fn drain_list_stream<R, I, S>(
     rpc_name: &'static str,
-    mut stream: Streaming<R>,
+    stream: S,
 ) -> Result<StreamPage<I>, Error>
 where
     R: Into<FrameKind<I>>,
+    S: Stream<Item = Result<R, tonic::Status>>,
 {
+    futures::pin_mut!(stream);
     let mut page = StreamPage::default();
     loop {
-        match stream.message().await {
-            Ok(Some(response)) => {
+        match stream.next().await {
+            Some(Ok(response)) => {
                 // Process and break on receiving `QueryEnd`.
                 if page.apply(response.into()) {
                     break;
                 }
             }
             // We expect the server to yield an `End` frame before reaching this branch.
-            Ok(None) => break,
+            None => break,
             // `DeadlineExceeded`: server-side `grpc-timeout` header fired.
             // `Cancelled`: client-side channel timeout fired (or upstream cancel).
             // Both are timeout-shaped — preserve partial work if any progress was made;
             // propagate as error only if zero progress, so the caller can reshape.
-            Err(status)
+            Some(Err(status))
                 if matches!(
                     status.code(),
                     tonic::Code::DeadlineExceeded | tonic::Code::Cancelled
@@ -414,7 +417,7 @@ where
                 }
                 break;
             }
-            Err(status) => {
+            Some(Err(status)) => {
                 return Err(
                     anyhow::anyhow!("{rpc_name} stream error: {}", status.message()).into(),
                 );
@@ -522,5 +525,88 @@ mod tests {
             page.apply(end_response(reason).into());
             assert!(!page.has_more(), "expected !has_more for {reason:?}");
         }
+    }
+
+    #[test]
+    fn apply_end_with_unknown_reason_folds_to_unspecified() {
+        // Reason int that doesn't decode to any known `QueryEndReason` variant — the SDK-skew
+        // case. We log and degrade to `Unspecified` so callers still see a terminal reason.
+        let mut end = grpc_alpha::QueryEnd::default();
+        end.reason = i32::MAX;
+        let mut response = grpc_alpha::ListTransactionsResponse::default();
+        response.response = Some(grpc_alpha::list_transactions_response::Response::End(end));
+
+        let mut page: StreamPage<grpc_alpha::TransactionItem> = StreamPage::default();
+        assert!(page.apply(response.into()));
+        assert_eq!(page.end_reason, Some(grpc_alpha::QueryEndReason::Unspecified));
+    }
+
+    #[test]
+    fn apply_unknown_frame_continues_draining() {
+        // Outer message with no oneof set — classifies to `FrameKind::Unknown`. `apply` should
+        // warn and continue (returns false) without mutating the page.
+        let response = grpc_alpha::ListTransactionsResponse::default();
+
+        let mut page: StreamPage<grpc_alpha::TransactionItem> = StreamPage::default();
+        assert!(!page.apply(response.into()));
+        assert!(page.items.is_empty());
+        assert_eq!(page.end_cursor, None);
+        assert_eq!(page.end_reason, None);
+    }
+
+    #[test]
+    fn empty_response_classifies_as_unknown() {
+        let response = grpc_alpha::ListTransactionsResponse::default();
+        let kind: FrameKind<grpc_alpha::TransactionItem> = response.into();
+        assert!(matches!(kind, FrameKind::Unknown));
+    }
+
+    async fn drain_iter(
+        responses: Vec<Result<grpc_alpha::ListTransactionsResponse, tonic::Status>>,
+    ) -> Result<StreamPage<grpc_alpha::TransactionItem>, Error> {
+        drain_list_stream("ListTransactions", futures::stream::iter(responses)).await
+    }
+
+    #[tokio::test]
+    async fn drain_preserves_partial_progress_on_timeout() {
+        // Two items + a server-side deadline. We never saw `QueryEnd`, but `end_cursor` was
+        // advanced — caller can resume from `c2`.
+        let page = drain_iter(vec![
+            Ok(item_response(b"c1")),
+            Ok(item_response(b"c2")),
+            Err(tonic::Status::deadline_exceeded("server budget")),
+        ])
+        .await
+        .expect("partial progress should be preserved");
+
+        assert_eq!(page.items.len(), 2);
+        assert_eq!(page.end_cursor.as_deref(), Some(b"c2".as_ref()));
+        assert_eq!(page.end_reason, None);
+        assert!(page.has_more());
+    }
+
+    #[tokio::test]
+    async fn drain_errors_on_zero_progress_half_close() {
+        // Server opens the stream, sends nothing, half-closes. `has_more` defaults to true
+        // (no End frame) and `end_cursor` is empty — the page is unresumable, so surface as
+        // an error rather than silently dropping forward progress.
+        let err = drain_iter(vec![])
+            .await
+            .expect_err("zero-progress half-close should error");
+        let msg = format!("{err}");
+        assert!(msg.contains("did not advance cursor"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn drain_returns_page_on_half_close_after_progress() {
+        // Server emitted one item, then half-closed without an End frame. The page is still
+        // valid and resumable from the item's watermark.
+        let page = drain_iter(vec![Ok(item_response(b"c1"))])
+            .await
+            .expect("partial-progress half-close should succeed");
+
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.end_cursor.as_deref(), Some(b"c1".as_ref()));
+        assert_eq!(page.end_reason, None);
     }
 }

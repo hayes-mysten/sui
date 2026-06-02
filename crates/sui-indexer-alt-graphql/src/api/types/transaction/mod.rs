@@ -441,13 +441,8 @@ impl Transaction {
         .map(Into::into)
     }
 
-    /// Serve transaction pagination from the roaring-bitmap index via the v2alpha
-    /// `ListTransactions` stream. The checkpoint window is derived exactly as the
-    /// Postgres path derives it (`checkpoint_bounds` over `reader_lo` /
-    /// `checkpoint_viewed_at` / filter bounds) and sent as a checkpoint range; the
-    /// opaque page cursors become `QueryOptions.after`/`before` (the position
-    /// within that window). Hydration is digest-only — contents resolve lazily via
-    /// `KvLoader` on field access, so this path never touches Postgres.
+    /// Serve transaction pagination by streaming the roaring-bitmap index. Returns pages that may
+    /// be partially filled, with valid cursors if there are more pages to paginate through.
     async fn paginate_bitmap(
         ctx: &Context<'_>,
         reader: &LedgerGrpcReader,
@@ -464,14 +459,8 @@ impl Transaction {
             return Ok(Connection::new(false, false).into());
         };
 
-        // Availability lower bound, keyed on the same active filters as the PG path.
-        let watermarks: &Arc<Watermarks> = ctx.data()?;
-        let available_range_key = AvailableRangeKey {
-            type_: "Query".to_string(),
-            field: Some("transactions".to_string()),
-            filters: Some(filter.active_filters()),
-        };
-        let reader_lo = available_range_key.reader_lo(watermarks)?;
+        // TODO: LedgerService expose available checkpoint range for `reader_lo`.
+        let reader_lo = 0;
 
         let Some(cp_bounds) = checkpoint_bounds(
             filter.after_checkpoint().map(u64::from),
@@ -512,10 +501,6 @@ impl Transaction {
             .await
             .map_err(|e| anyhow::anyhow!("ListTransactions request failed: {e}"))?;
 
-        // Can't reuse `page.paginate_results`: it detects `hasPrev`/`hasNext` via cursor equality
-        // with the supplied `after`/`before`, but streaming api bounds are exclusive (boundary
-        // never returned). Stream termination (`SCAN_LIMIT`, `ITEM_LIMIT`, unknown end reason, or
-        // no `QueryEnd` frame at all) also need to be handled as a "more results" signal.
         build_bitmap_connection(scope, &page, result)
     }
 }

@@ -159,20 +159,6 @@ impl TransactionFilter {
         filters
     }
 
-    /// Lower this filter's predicate fields into a single-term v2alpha proto
-    /// `TransactionFilter` for a bitmap scan. Returns `None` when no positive
-    /// predicate is set — an unfiltered scan over the checkpoint range, where the
-    /// proto `filter` field is left absent.
-    ///
-    /// `TransactionFilterValidator` permits at most one of
-    /// `[affectedAddress, affectedObject, function]`, optionally combined with
-    /// `sentAddress`, so the result is always a single `TransactionTerm` (an AND)
-    /// of one or two `Include` literals — the trivial anchored-DNF shape. Checkpoint
-    /// bounds are not encoded here; they become the request's checkpoint range.
-    ///
-    /// Precondition: `kind` must be `None`. The `kind` filter has no bitmap
-    /// dimension and is routed to Postgres before reaching this builder, so any
-    /// `kind` predicate is ignored here.
     pub(crate) fn to_bitmap_filter(&self) -> Option<v2alpha::TransactionFilter> {
         let mut literals = Vec::new();
 
@@ -294,8 +280,6 @@ impl CheckpointBounds for TransactionFilter {
     }
 }
 
-/// Wrap a predicate as an `Include` literal (the only polarity the parity filter
-/// emits — `Exclude`/negation is part of the later DNF-expressive phase).
 fn include_literal(
     predicate: v2alpha::transaction_predicate::Predicate,
 ) -> v2alpha::TransactionLiteral {
