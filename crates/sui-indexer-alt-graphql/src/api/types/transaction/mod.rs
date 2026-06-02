@@ -77,18 +77,12 @@ pub(crate) struct TransactionContents {
     pub(crate) contents: Option<Arc<NativeTransactionContents>>,
 }
 
-/// Cursor for transaction pagination, BCS-encoded. BCS serializes the enum's
-/// variant index, which doubles as the discriminant that distinguishes the two
-/// paths: the Postgres path emits/consumes `Seq` (a `tx_sequence_number`); the
-/// bitmap path emits/consumes `Opaque` (the v2alpha `Watermark.cursor` bytes). A
-/// cursor of the wrong variant for the active path is rejected loudly rather than
-/// misinterpreted (see `Transaction::paginate`).
-///
-/// Note: this is a new wire format, so cursors minted by an older build won't
-/// decode — acceptable, as pagination cursors are short-lived.
+/// Cursor for transaction pagination.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) enum TxCursor {
+    /// Cursor from Postgres implementation.
     Seq(u64),
+    /// Cursor from bitmap implementation.
     Opaque(Vec<u8>),
 }
 
