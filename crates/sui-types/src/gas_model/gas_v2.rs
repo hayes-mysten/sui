@@ -22,54 +22,6 @@ mod checked {
     use sui_protocol_config::*;
 
     /// A bucket defines a range of units that will be priced the same.
-    /// After execution a call to `GasStatus::bucketize` will round the computation
-    /// cost to `cost` for the bucket ([`min`, `max`]) the gas used falls into.
-    #[allow(dead_code)]
-    pub(crate) struct ComputationBucket {
-        min: u64,
-        max: u64,
-        cost: u64,
-    }
-
-    impl ComputationBucket {
-        fn new(min: u64, max: u64, cost: u64) -> Self {
-            ComputationBucket { min, max, cost }
-        }
-
-        fn simple(min: u64, max: u64) -> Self {
-            Self::new(min, max, max)
-        }
-    }
-
-    fn get_bucket_cost(table: &[ComputationBucket], computation_cost: u64) -> u64 {
-        for bucket in table {
-            if bucket.max >= computation_cost {
-                return bucket.cost;
-            }
-        }
-        match table.last() {
-            // maybe not a literal here could be better?
-            None => 5_000_000,
-            Some(bucket) => bucket.cost,
-        }
-    }
-
-    // define the bucket table for computation charging
-    // If versioning defines multiple functions and
-    fn computation_bucket(max_bucket_cost: u64) -> Vec<ComputationBucket> {
-        assert!(max_bucket_cost >= 5_000_000);
-        vec![
-            ComputationBucket::simple(0, 1_000),
-            ComputationBucket::simple(1_000, 5_000),
-            ComputationBucket::simple(5_000, 10_000),
-            ComputationBucket::simple(10_000, 20_000),
-            ComputationBucket::simple(20_000, 50_000),
-            ComputationBucket::simple(50_000, 200_000),
-            ComputationBucket::simple(200_000, 1_000_000),
-            ComputationBucket::simple(1_000_000, max_bucket_cost),
-        ]
-    }
-
     /// Portion of the storage rebate that gets passed on to the transaction sender. The remainder
     /// will be burned, then re-minted + added to the storage fund at the next epoch change
     fn sender_rebate(storage_rebate: u64, storage_rebate_rate: u64) -> u64 {
@@ -101,8 +53,6 @@ mod checked {
         storage_per_byte_cost: u64,
         /// Execution cost table to be used.
         pub execution_cost_table: CostTable,
-        /// Computation buckets to cost transaction in price groups
-        computation_bucket: Vec<ComputationBucket>,
         /// Max gas price for aborted transactions.
         max_gas_price_rgp_factor_for_aborted_transactions: Option<u64>,
     }
@@ -129,7 +79,6 @@ mod checked {
                 object_read_per_byte_cost: c.obj_access_cost_read_per_byte(),
                 storage_per_byte_cost: c.obj_data_cost_refundable(),
                 execution_cost_table: cost_table_for_version(c.gas_model_version()),
-                computation_bucket: computation_bucket(c.max_gas_computation_bucket()),
                 max_gas_price_rgp_factor_for_aborted_transactions: c
                     .max_gas_price_rgp_factor_for_aborted_transactions_as_option(),
             }
@@ -143,8 +92,6 @@ mod checked {
                 object_read_per_byte_cost: 0,
                 storage_per_byte_cost: 0,
                 execution_cost_table: ZERO_COST_SCHEDULE.clone(),
-                // should not matter
-                computation_bucket: computation_bucket(5_000_000),
                 max_gas_price_rgp_factor_for_aborted_transactions: None,
             }
         }
@@ -164,16 +111,6 @@ mod checked {
         pub storage_rebate: u64,
         /// The object size post-transaction in bytes
         pub new_size: u64,
-    }
-
-    #[derive(Debug, Clone, Copy)]
-    enum GasRoundingMode {
-        /// Bucketize the computation cost according to predefined buckets.
-        Bucketize,
-        /// Rounding value to round up gas charges.
-        Stepped(u64),
-        /// Round by keeping just over half digits
-        KeepHalfDigits,
     }
 
     #[allow(dead_code)]
@@ -217,8 +154,6 @@ mod checked {
         /// Amount of storage rebate accumulated when we are running in unmetered mode (i.e. system transaction).
         /// This allows us to track how much storage rebate we need to retain in system transactions.
         unmetered_storage_rebate: u64,
-        /// Rounding mode for gas charges.
-        gas_rounding_mode: GasRoundingMode,
         /// When true, `uncapped_computation_cost` and `derived_computation_cost`
         /// short-circuit to `gas_budget` instead of deriving from the Move VM
         /// meter. Set by `adjust_computation_on_out_of_gas` on the err-path
@@ -239,14 +174,8 @@ mod checked {
             reference_gas_price: u64,
             storage_gas_price: u64,
             rebate_rate: u64,
-            gas_rounding_mode: GasRoundingMode,
             cost_table: SuiCostTable,
         ) -> SuiGasStatus {
-            let gas_rounding_mode = match gas_rounding_mode {
-                GasRoundingMode::Bucketize => GasRoundingMode::Bucketize,
-                GasRoundingMode::Stepped(val) => GasRoundingMode::Stepped(val.max(1)),
-                GasRoundingMode::KeepHalfDigits => GasRoundingMode::KeepHalfDigits,
-            };
             SuiGasStatus {
                 gas_status: move_gas_status,
                 gas_budget,
@@ -258,7 +187,6 @@ mod checked {
                 per_object_storage: Vec::new(),
                 rebate_rate,
                 unmetered_storage_rebate: 0,
-                gas_rounding_mode,
                 cost_table,
                 force_computation_cost_to_budget: false,
             }
@@ -277,14 +205,10 @@ mod checked {
             } else {
                 gas_budget
             };
+            // `gas_rounding_halve_digits` has been true at every protocol version this
+            // execution version handles, so rounding is always `half_digits_rounding` in
+            // `uncapped_computation_cost`; no enum, no per-version branch.
             let sui_cost_table = SuiCostTable::new(config, gas_price);
-            let gas_rounding_mode = if config.gas_rounding_halve_digits() {
-                GasRoundingMode::KeepHalfDigits
-            } else if let Some(step) = config.gas_rounding_step_as_option() {
-                GasRoundingMode::Stepped(step)
-            } else {
-                GasRoundingMode::Bucketize
-            };
             Self::new(
                 GasStatus::new(
                     sui_cost_table.execution_cost_table.clone(),
@@ -298,7 +222,6 @@ mod checked {
                 reference_gas_price,
                 storage_gas_price,
                 config.storage_rebate_rate(),
-                gas_rounding_mode,
                 sui_cost_table,
             )
         }
@@ -312,7 +235,6 @@ mod checked {
                 0,
                 0,
                 0,
-                GasRoundingMode::Bucketize,
                 SuiCostTable::unmetered(),
             )
         }
@@ -348,19 +270,7 @@ mod checked {
                 return self.gas_budget;
             }
             let raw_units = self.gas_status.gas_used_pre_gas_price();
-            let bucketed_units = match self.gas_rounding_mode {
-                GasRoundingMode::KeepHalfDigits => half_digits_rounding(raw_units),
-                GasRoundingMode::Stepped(gas_rounding) => {
-                    if raw_units > 0 && raw_units % gas_rounding == 0 {
-                        raw_units
-                    } else {
-                        ((raw_units / gas_rounding) + 1) * gas_rounding
-                    }
-                }
-                GasRoundingMode::Bucketize => {
-                    get_bucket_cost(&self.cost_table.computation_bucket, raw_units)
-                }
-            };
+            let bucketed_units = half_digits_rounding(raw_units);
             bucketed_units.saturating_mul(self.effective_gas_price)
         }
 
