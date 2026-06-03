@@ -8,7 +8,7 @@ pub use checked::*;
 mod checked {
     use crate::error::{UserInputError, UserInputResult};
     use crate::gas::{self, GasCostSummary, GasUsageReport, SuiGasStatusAPI};
-    use crate::gas_model::gas_predicates::{cost_table_for_version, txn_base_cost_as_multiplier};
+    use crate::gas_model::gas_predicates::cost_table_for_version;
     use crate::gas_model::units_types::CostTable;
     use crate::transaction::ObjectReadResult;
     use crate::{
@@ -118,11 +118,10 @@ mod checked {
         pub(crate) fn new(c: &ProtocolConfig, gas_price: u64) -> Self {
             // gas_price here is the Reference Gas Price, however we may decide
             // to change it to be the price passed in the transaction
-            let min_transaction_cost = if txn_base_cost_as_multiplier(c) {
-                c.base_tx_cost_fixed() * gas_price
-            } else {
-                c.base_tx_cost_fixed()
-            };
+            // `txn_base_cost_as_multiplier` has been true at every protocol version this
+            // execution version handles (gas_model 13+ = v123+), so the base cost is always
+            // scaled by gas_price.
+            let min_transaction_cost = c.base_tx_cost_fixed() * gas_price;
             Self {
                 min_transaction_cost,
                 max_gas_budget: c.max_tx_gas(),
