@@ -53,8 +53,10 @@ mod checked {
         storage_per_byte_cost: u64,
         /// Execution cost table to be used.
         pub execution_cost_table: CostTable,
-        /// Max gas price for aborted transactions.
-        max_gas_price_rgp_factor_for_aborted_transactions: Option<u64>,
+        /// RGP-multiplier cap on the effective gas price for aborted transactions. The
+        /// protocol-config field has been `Some(_)` at every version this execution
+        /// version handles, so it's stored as a plain `u64`.
+        max_gas_price_rgp_factor_for_aborted_transactions: u64,
     }
 
     impl std::fmt::Debug for SuiCostTable {
@@ -80,7 +82,7 @@ mod checked {
                 storage_per_byte_cost: c.obj_data_cost_refundable(),
                 execution_cost_table: cost_table_for_version(c.gas_model_version()),
                 max_gas_price_rgp_factor_for_aborted_transactions: c
-                    .max_gas_price_rgp_factor_for_aborted_transactions_as_option(),
+                    .max_gas_price_rgp_factor_for_aborted_transactions(),
             }
         }
 
@@ -92,7 +94,9 @@ mod checked {
                 object_read_per_byte_cost: 0,
                 storage_per_byte_cost: 0,
                 execution_cost_table: ZERO_COST_SCHEDULE.clone(),
-                max_gas_price_rgp_factor_for_aborted_transactions: None,
+                // Unmetered txs never enter `bucketize_computation`, so this value is
+                // never observed; 0 is fine as a placeholder.
+                max_gas_price_rgp_factor_for_aborted_transactions: 0,
             }
         }
     }
@@ -396,13 +400,11 @@ mod checked {
             // bucketing math itself lives in `uncapped_computation_cost`, which
             // `summary()` calls on demand through `derived_computation_cost`.
             self.effective_gas_price = if aborted.unwrap_or(false) {
-                match self
+                let cap = self
                     .cost_table
                     .max_gas_price_rgp_factor_for_aborted_transactions
-                {
-                    Some(factor) => self.user_gas_price.min(factor * self.reference_gas_price),
-                    None => self.user_gas_price,
-                }
+                    * self.reference_gas_price;
+                self.user_gas_price.min(cap)
             } else {
                 self.user_gas_price
             };
